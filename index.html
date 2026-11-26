@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-<title>2026년 7월 일맥 정기모임 AI 포토존</title>
+<title>왕·왕비 AR 포토존</title>
 
 <link rel="preload" as="image" href="royal_self.png">
 <link rel="preload" as="image" href="royal_people.png">
@@ -220,7 +220,7 @@ html, body {
 
 <div id="loading">
   <div>
-    👑 AI 포토존을 준비하고 있습니다.<br>
+    👑 왕·왕비 AR 포토존을 준비하고 있습니다.<br>
     잠시만 기다려 주세요.
   </div>
 </div>
@@ -231,7 +231,7 @@ html, body {
 <div id="captureGuide">촬영 버튼으로<br>인증샷을 저장하세요</div>
 
 <div id="menu">
-  <h1>2026년 7월 일맥 AI 포토존</h1>
+  <h1>왕·왕비 AR 포토존</h1>
   <div class="subtitle">창덕궁 인정전 추억 인증샷</div>
 
   <div class="mode-card">
@@ -323,30 +323,103 @@ Promise.all(preloadImages.map(loadImage)).then(() => {
   menu.style.display = "block";
 });
 
-async function startCamera(cameraMode) {
-  if (currentStream) {
-    currentStream.getTracks().forEach(track => track.stop());
-  }
-
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: {
-      facingMode: { ideal: cameraMode },
-      width: { ideal: 1280 },
-      height: { ideal: 720 }
-    },
-    audio: false
-  });
-
-  video.srcObject = stream;
-  currentStream = stream;
-
-  return new Promise((resolve) => {
-    video.onloadedmetadata = () => {
-      video.play();
-      resolve();
-    };
-  });
+let cameraSession = 0;
+let starting = false;
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+function stopStream(stream) { if (stream) stream.getTracks().forEach(t => t.stop()); }
+function releaseCamera() {
+  cameraSession++;
+  stopStream(currentStream);
+  currentStream = null;
+  video.pause();
+  video.srcObject = null;
 }
+function statusMessage(text) {
+  loading.querySelector('div').textContent = text;
+  loading.style.display = 'flex';
+}
+function cameraError(name, message) { return new DOMException(message, name); }
+function isRear(track) {
+  const facing = track.getSettings().facingMode;
+  return facing ? facing === 'environment' : /back|rear|environment|후면/i.test(track.label);
+}
+function fatal(err) { return ['NotAllowedError','SecurityError','AbortError','TimeoutError'].includes(err.name); }
+async function bounded(promise, deadline, onLate) {
+  let expired = false, timer;
+  const guarded = Promise.resolve(promise).then(value => {
+    if (expired) { if (onLate) onLate(value); throw cameraError('TimeoutError','Camera timeout'); }
+    return value;
+  });
+  try {
+    return await Promise.race([guarded, new Promise((_, reject) => {
+      timer = setTimeout(() => { expired = true; reject(cameraError('TimeoutError','Camera timeout')); }, Math.max(0, deadline-Date.now()));
+    })]);
+  } finally { clearTimeout(timer); }
+}
+async function startCamera(cameraMode) {
+  releaseCamera();
+  const session = cameraSession, deadline = Date.now()+60000;
+  const media = navigator.mediaDevices;
+  if (!media || !media.getUserMedia) throw cameraError('NotSupportedError','Camera unavailable');
+  function check() {
+    if (session !== cameraSession) throw cameraError('AbortError','Session ended');
+    if (Date.now() >= deadline) throw cameraError('TimeoutError','Camera timeout');
+  }
+  async function acquire(constraints) {
+    check();
+    const stream = await bounded(media.getUserMedia({video:constraints,audio:false}), deadline, stopStream);
+    try { check(); } catch(e) { stopStream(stream); throw e; }
+    return stream;
+  }
+  async function attempt(constraints) {
+    const stream = await acquire(constraints);
+    try {
+      const track = stream.getVideoTracks()[0];
+      if (!track || (cameraMode === 'environment' && !isRear(track))) throw cameraError('NotFoundError','Rear camera not confirmed');
+      currentStream = stream;
+      video.srcObject = stream;
+      await bounded(video.play(), deadline);
+      check();
+      if (!video.videoWidth || !video.videoHeight) throw cameraError('NotReadableError','No video frames');
+    } catch(e) {
+      stopStream(stream);
+      if (currentStream === stream) { currentStream = null; video.srcObject = null; }
+      throw e;
+    }
+  }
+  statusMessage('카메라를 실행하고 있습니다.');
+  try {
+    await attempt({facingMode:{ideal:cameraMode},width:{ideal:1280},height:{ideal:720}});
+    return;
+  } catch(e) { if (cameraMode !== 'environment' || fatal(e)) throw e; }
+  statusMessage('다른 후면카메라를 찾고 있습니다.');
+  let devices = await bounded(media.enumerateDevices(),deadline);
+  if (!devices.some(d => d.kind === 'videoinput' && d.label)) {
+    let probe;
+    try {
+      probe = await acquire(true);
+      devices = await bounded(media.enumerateDevices(),deadline);
+    } catch(e) { if (fatal(e)) throw e; }
+    finally { stopStream(probe); }
+  }
+  const candidates = devices.filter(d => d.kind === 'videoinput' && d.deviceId && !/front|user|전면/i.test(d.label));
+  candidates.sort((a,b) => Number(/back|rear|environment|후면/i.test(b.label))-Number(/back|rear|environment|후면/i.test(a.label)));
+  let last = cameraError('NotFoundError','No rear camera');
+  for (const d of candidates) {
+    for (const extra of [{},{width:{ideal:640},height:{ideal:480},frameRate:{ideal:15}}]) {
+      check(); await delay(700);
+      try { await attempt({deviceId:{exact:d.deviceId},...extra}); return; }
+      catch(e) { last=e; if (fatal(e)) throw e; console.warn('Camera candidate failed',d.label,e.name); }
+    }
+  }
+  throw last;
+}
+function explainCameraError(err) {
+  if (['NotAllowedError','SecurityError'].includes(err.name)) return '카메라 사용 권한을 확인해 주세요. 브라우저 또는 카카오톡의 사이트 설정에서 카메라를 허용한 후 다시 선택해 주세요.';
+  if (err.name === 'NotSupportedError') return '이 브라우저에서는 카메라를 사용할 수 없습니다. Chrome 또는 삼성 브라우저에서 다시 접속해 주세요.';
+  return '카메라를 실행하지 못했습니다.\n다른 카메라 사용 앱을 종료하고 브라우저를 다시 열어 주세요. 문제가 지속되면 스마트폰을 재부팅해 주세요.\n오류 코드: '+(err.name || 'UnknownError');
+}
+window.addEventListener('pagehide', releaseCamera);
 
 function waitOverlayLoaded(imageFile) {
   return new Promise((resolve) => {
@@ -357,6 +430,8 @@ function waitOverlayLoaded(imageFile) {
 }
 
 async function startPhotozone(imageFile, cameraMode, guideText) {
+  if (starting) return;
+  starting = true;
   try {
     loading.style.display = "none";
     menu.style.display = "none";
@@ -371,6 +446,7 @@ async function startPhotozone(imageFile, cameraMode, guideText) {
 
     await waitOverlayLoaded(imageFile);
     await startCamera(cameraMode);
+    loading.style.display = "none";
 
     currentImageFile = imageFile;
     overlayScale = 1;
@@ -389,11 +465,15 @@ async function startPhotozone(imageFile, cameraMode, guideText) {
   } catch (err) {
     loading.style.display = "none";
     menu.style.display = "block";
-    alert("카메라 사용을 허용해 주세요. 이미 거부하셨다면 브라우저 또는 카카오톡의 사이트 설정에서 카메라 권한을 허용으로 바꿔 주세요.");
+    releaseCamera();
+    alert(explainCameraError(err));
+  } finally {
+    starting = false;
   }
 }
 
 function showMenu() {
+  releaseCamera();
   menu.style.display = "block";
   loading.style.display = "none";
   captureBtn.style.display = "none";
